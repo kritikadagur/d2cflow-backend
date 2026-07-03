@@ -17,10 +17,13 @@ const fs = require('fs');
 const PORT = process.env.PORT || 8080;
 const PYTHON_BACKEND = process.env.PYTHON_BACKEND || 'http://localhost:8000';
 const AUTH_DIR = process.env.AUTH_DIR || path.join(__dirname, 'auth');
+const STORE_DIR = process.env.STORE_DIR || path.join(__dirname, 'store');
+const CHATS_FILE = path.join(STORE_DIR, 'chats.json');
 const LOG_LEVEL = process.env.LOG_LEVEL || 'silent';
 
 // Ensure auth directory exists
 fs.mkdirSync(AUTH_DIR, { recursive: true });
+fs.mkdirSync(STORE_DIR, { recursive: true });
 
 const app = express();
 app.use(express.json());
@@ -31,6 +34,85 @@ let currentQR = null;
 let connected = false;
 let connecting = false;
 let phoneNumber = '';
+let knownChats = loadKnownChats();
+
+function loadKnownChats() {
+  try {
+    if (fs.existsSync(CHATS_FILE)) {
+      return new Map(JSON.parse(fs.readFileSync(CHATS_FILE, 'utf8')).map((c) => [c.jid, c]));
+    }
+  } catch (e) {
+    console.error('[Bridge] Failed to load chats:', e.message);
+  }
+  return new Map();
+}
+
+function saveKnownChats() {
+  try {
+    fs.writeFileSync(CHATS_FILE, JSON.stringify([...knownChats.values()], null, 2));
+  } catch (e) {
+    console.error('[Bridge] Failed to save chats:', e.message);
+  }
+}
+
+function isUsefulJid(jid = '') {
+  return (
+    (jid.endsWith('@s.whatsapp.net') || jid.endsWith('@g.us')) &&
+    !jid.includes('@lid') &&
+    !jid.includes('@broadcast') &&
+    !jid.includes('@newsletter')
+  );
+}
+
+function rememberChat(jid, attrs = {}) {
+  if (!isUsefulJid(jid)) return;
+  const prev = knownChats.get(jid) || {};
+  knownChats.set(jid, {
+    jid,
+    name: attrs.name || prev.name || attrs.notify || attrs.subject || jid.split('@')[0],
+    is_group: jid.endsWith('@g.us'),
+    last_message_time: attrs.last_message_time || prev.last_message_time || null,
+  });
+}
+
+function normaliseTimestamp(ts) {
+  if (!ts) return new Date().toISOString();
+  if (typeof ts === 'number') {
+    return new Date(ts > 10_000_000_000 ? ts : ts * 1000).toISOString();
+  }
+  if (typeof ts === 'object' && typeof ts.toNumber === 'function') {
+    const n = ts.toNumber();
+    return new Date(n > 10_000_000_000 ? n : n * 1000).toISOString();
+  }
+  return String(ts);
+}
+
+function unwrapMessage(message = {}) {
+  return (
+    message.ephemeralMessage?.message ||
+    message.viewOnceMessage?.message ||
+    message.viewOnceMessageV2?.message ||
+    message.documentWithCaptionMessage?.message ||
+    message
+  );
+}
+
+function extractBody(message = {}) {
+  const unwrapped = unwrapMessage(message);
+  return (
+    unwrapped.conversation ||
+    unwrapped.extendedTextMessage?.text ||
+    unwrapped.imageMessage?.caption ||
+    unwrapped.videoMessage?.caption ||
+    unwrapped.buttonsResponseMessage?.selectedDisplayText ||
+    unwrapped.buttonsResponseMessage?.selectedButtonId ||
+    unwrapped.listResponseMessage?.title ||
+    unwrapped.listResponseMessage?.singleSelectReply?.selectedRowId ||
+    unwrapped.templateButtonReplyMessage?.selectedDisplayText ||
+    unwrapped.templateButtonReplyMessage?.selectedId ||
+    ''
+  );
+}
 
 // ── Start WhatsApp connection ─────────────────────────────────────────────
 
@@ -90,6 +172,59 @@ async function connect() {
     }
   });
 
+  sock.ev.on('messaging-history.set', ({ chats = [], contacts = [] }) => {
+    for (const chat of chats) {
+      rememberChat(chat.id, {
+        name: chat.name || chat.subject,
+        last_message_time: chat.conversationTimestamp ? normaliseTimestamp(chat.conversationTimestamp) : null,
+      });
+    }
+    for (const contact of contacts) {
+      rememberChat(contact.id, {
+        name: contact.name || contact.notify || contact.verifiedName,
+      });
+    }
+    saveKnownChats();
+  });
+
+  sock.ev.on('chats.upsert', (chats = []) => {
+    for (const chat of chats) {
+      rememberChat(chat.id, {
+        name: chat.name || chat.subject,
+        last_message_time: chat.conversationTimestamp ? normaliseTimestamp(chat.conversationTimestamp) : null,
+      });
+    }
+    saveKnownChats();
+  });
+
+  sock.ev.on('chats.update', (chats = []) => {
+    for (const chat of chats) {
+      rememberChat(chat.id, {
+        name: chat.name || chat.subject,
+        last_message_time: chat.conversationTimestamp ? normaliseTimestamp(chat.conversationTimestamp) : null,
+      });
+    }
+    saveKnownChats();
+  });
+
+  sock.ev.on('contacts.upsert', (contacts = []) => {
+    for (const contact of contacts) {
+      rememberChat(contact.id, {
+        name: contact.name || contact.notify || contact.verifiedName,
+      });
+    }
+    saveKnownChats();
+  });
+
+  sock.ev.on('contacts.update', (contacts = []) => {
+    for (const contact of contacts) {
+      rememberChat(contact.id, {
+        name: contact.name || contact.notify || contact.verifiedName,
+      });
+    }
+    saveKnownChats();
+  });
+
   // ── Incoming messages ──────────────────────────────────────────────────
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
     if (type !== 'notify') return;
@@ -98,23 +233,25 @@ async function connect() {
       if (msg.key.fromMe) continue;
 
       const from = msg.key.remoteJid || '';
-      const body =
-        msg.message?.conversation ||
-        msg.message?.extendedTextMessage?.text ||
-        msg.message?.imageMessage?.caption ||
-        '';
+      const unwrappedMessage = unwrapMessage(msg.message || {});
+      const body = extractBody(unwrappedMessage);
 
-      if (!body && !msg.message?.orderMessage) continue;
+      if (!body && !unwrappedMessage?.orderMessage) continue;
 
       console.log(`[Bridge] MSG from ${from}: ${body.slice(0, 80)}`);
+      rememberChat(from, {
+        name: msg.pushName || from.split('@')[0],
+        last_message_time: normaliseTimestamp(msg.messageTimestamp),
+      });
+      saveKnownChats();
 
       // Forward to Python backend
       await notifyPython('/api/whatsapp/incoming', {
         from,
         body,
-        timestamp: msg.messageTimestamp,
+        timestamp: normaliseTimestamp(msg.messageTimestamp),
         message_id: msg.key.id,
-        order_data: msg.message?.orderMessage || null,
+        order_data: unwrappedMessage?.orderMessage || null,
       });
     }
   });
@@ -146,8 +283,20 @@ app.get('/api/status', (req, res) => {
     connected,
     qr: currentQR || null,
     phone: phoneNumber,
+    chats: knownChats.size,
     status: connected ? 'connected' : currentQR ? 'qr_pending' : 'offline',
   });
+});
+
+app.get('/api/chats', (req, res) => {
+  const q = String(req.query.q || '').toLowerCase();
+  const limit = Math.min(Number(req.query.limit || 100), 500);
+  let chats = [...knownChats.values()];
+  if (q) {
+    chats = chats.filter((c) => `${c.name || ''} ${c.jid}`.toLowerCase().includes(q));
+  }
+  chats.sort((a, b) => String(b.last_message_time || '').localeCompare(String(a.last_message_time || '')));
+  res.json({ chats: chats.slice(0, limit), total: chats.length });
 });
 
 // Send a message — called by Python backend

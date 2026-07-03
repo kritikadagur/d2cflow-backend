@@ -113,6 +113,8 @@ def scan_all() -> list[dict]:
 
 
 def main():
+    global BACKEND_URL
+
     parser = argparse.ArgumentParser(description="WhatsApp Order Scanner")
     parser.add_argument("--chat-jid", help="Specific chat JID to scan")
     parser.add_argument("--chat-name", default="", help="Chat display name")
@@ -120,7 +122,6 @@ def main():
     parser.add_argument("--backend-url", default=BACKEND_URL, help=f"Backend URL (default: {BACKEND_URL})")
     args = parser.parse_args()
 
-    global BACKEND_URL
     BACKEND_URL = args.backend_url
 
     if args.all:

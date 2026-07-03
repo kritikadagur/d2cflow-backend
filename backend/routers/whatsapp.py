@@ -24,12 +24,15 @@ import subprocess
 import threading
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import List, Optional
+from typing import Any, List, Optional
 
 import httpx
 from apscheduler.schedulers.background import BackgroundScheduler
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+
+from ..config import get_settings
+from ..database import get_db
 
 # ── Config (all overridable via env vars) ─────────────────────────────────────
 
@@ -136,6 +139,219 @@ def _persist_all() -> None:
     _save_json(_CONFIRMATIONS_FILE, _pending_confirmations)
     _save_json(_BROADCASTS_FILE, _pending_broadcasts)
     _save_json(_CONV_STATES_FILE, _conversation_states)
+
+
+def _has_supabase_config() -> bool:
+    s = get_settings()
+    return bool(s.supabase_url and s.supabase_service_key)
+
+
+def _safe_float(value, default: float = 0.0) -> float:
+    try:
+        if value is None or value == "":
+            return default
+        return float(str(value).replace(",", ""))
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_int(value, default: int = 1) -> int:
+    try:
+        if value is None or value == "":
+            return default
+        return max(1, int(float(value)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_nonnegative_int(value, default: int = 0) -> int:
+    try:
+        if value is None or value == "":
+            return default
+        return max(0, int(float(value)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _phone_from_jid(jid: str) -> str:
+    return (jid or "").split("@")[0].split("-")[0]
+
+
+def _total_for_items(items: List[dict]) -> float:
+    return sum(_safe_float(i.get("price") or i.get("unit_price")) * _safe_int(i.get("qty")) for i in items)
+
+
+def _order_total(order: dict) -> float:
+    items = order.get("items") or []
+    return _safe_float(order.get("total"), _total_for_items(items) or _safe_float(order.get("price")))
+
+
+def _normalise_wa_items(order: dict, db=None) -> List[dict]:
+    raw_items = order.get("items") or []
+    if not raw_items:
+        raw_items = [{
+            "name": order.get("product_hint") or "WhatsApp Order",
+            "sku": order.get("product_sku"),
+            "product_id": order.get("product_id"),
+            "qty": order.get("qty", 1),
+            "price": order.get("catalog_price") or order.get("price") or 0,
+        }]
+
+    rows = []
+    sku_candidates = set()
+    for item in raw_items:
+        sku = item.get("sku") or item.get("product_sku")
+        if sku and sku != "—":
+            sku_candidates.add(str(sku))
+
+    existing_skus = set()
+    if db and sku_candidates:
+        try:
+            result = db.table("skus").select("sku").in_("sku", list(sku_candidates)).execute()
+            existing_skus = {r["sku"] for r in result.data or [] if r.get("sku")}
+        except Exception as e:
+            logger.debug("Could not validate WhatsApp item SKUs: %s", e)
+
+    for item in raw_items:
+        sku = item.get("sku") or item.get("product_sku")
+        sku = str(sku) if sku and sku != "—" else None
+        qty = _safe_int(item.get("qty"), _safe_int(order.get("qty")))
+        unit_price = _safe_float(item.get("unit_price"), _safe_float(item.get("price"), _safe_float(order.get("catalog_price") or order.get("price"))))
+        rows.append({
+            "sku": sku if sku in existing_skus else None,
+            "channel_sku_id": item.get("channel_sku_id") or sku or item.get("product_id") or order.get("product_id"),
+            "name": item.get("name") or item.get("product_name") or order.get("product_hint") or "WhatsApp Order",
+            "qty": qty,
+            "unit_price": unit_price,
+            "cost_price": None,
+        })
+    return rows
+
+
+def _local_storage_payload(order: dict) -> dict:
+    items = []
+    for item in order.get("items") or []:
+        items.append({
+            "name": item.get("name") or order.get("product_hint") or "WhatsApp Order",
+            "product_id": item.get("product_id") or order.get("product_id"),
+            "sku": item.get("sku") or item.get("product_sku") or item.get("channel_sku_id"),
+            "qty": _safe_int(item.get("qty")),
+            "unit_price": _safe_float(item.get("unit_price"), _safe_float(item.get("price"))),
+            "price": _safe_float(item.get("price"), _safe_float(item.get("unit_price"))),
+        })
+
+    total = _order_total({**order, "items": items})
+    return {
+        "id": order.get("channel_order_id") or order.get("id"),
+        "db_order_id": order.get("db_order_id"),
+        "customer": order.get("customer_name") or "Customer",
+        "phone": order.get("customer_phone") or _phone_from_jid(order.get("chat_jid", "")) or "—",
+        "items": items,
+        "price": total,
+        "total": total,
+        "status": "new",
+        "channel": "whatsapp",
+        "source_message": order.get("message_text", ""),
+        "chat_jid": order.get("chat_jid"),
+        "payment_link": order.get("payment_link"),
+        "payment_link_id": order.get("payment_link_id"),
+    }
+
+
+def _persist_whatsapp_order(order: dict) -> Optional[dict]:
+    """
+    Sync a confirmed WhatsApp order into the canonical Supabase orders tables.
+    The JSON store remains the fast UI/event cache; Supabase is the durable order system.
+    """
+    order["localStorage_payload"] = _local_storage_payload(order)
+    if not _has_supabase_config():
+        return None
+
+    try:
+        db = get_db()
+        now = datetime.now(timezone.utc).isoformat()
+        channel_order_id = str(order.get("channel_order_id") or order.get("id") or f"WA-{uuid.uuid4().hex[:8].upper()}")
+        order["channel_order_id"] = channel_order_id
+        if not order.get("id"):
+            order["id"] = channel_order_id
+
+        items = _normalise_wa_items(order, db=db)
+        total = _order_total(order)
+        chat_jid = order.get("chat_jid", "")
+        customer_phone = order.get("customer_phone") or _phone_from_jid(chat_jid)
+
+        row = {
+            "channel": "whatsapp",
+            "channel_order_id": channel_order_id,
+            "status": order.get("status") or "confirmed",
+            "payment_mode": order.get("payment_mode") or "prepaid",
+            "customer_name": order.get("customer_name") or "Customer",
+            "customer_phone": customer_phone,
+            "customer_email": order.get("customer_email"),
+            "shipping_address": order.get("shipping_address"),
+            "pincode": order.get("pincode"),
+            "state": order.get("state"),
+            "total_amount": total,
+            "raw_payload": order,
+            "source": order.get("source") or "whatsapp",
+            "chat_jid": chat_jid,
+            "payment_link": order.get("payment_link"),
+            "payment_link_id": order.get("payment_link_id"),
+            "updated_at": now,
+        }
+        if order.get("created_at") or order.get("detected_at"):
+            row["created_at"] = order.get("created_at") or order.get("detected_at")
+
+        existing = (
+            db.table("orders")
+            .select("id")
+            .eq("channel", "whatsapp")
+            .eq("channel_order_id", channel_order_id)
+            .execute()
+        )
+
+        if existing.data:
+            db_order_id = existing.data[0]["id"]
+            db.table("orders").update(row).eq("id", db_order_id).execute()
+            db.table("order_items").delete().eq("order_id", db_order_id).execute()
+        else:
+            result = db.table("orders").insert(row).execute()
+            db_order_id = result.data[0]["id"]
+
+        for item in items:
+            item["order_id"] = db_order_id
+        if items:
+            db.table("order_items").insert(items).execute()
+
+        order["db_order_id"] = db_order_id
+        order["db_synced_at"] = now
+        order["localStorage_payload"] = _local_storage_payload(order)
+        return {"id": db_order_id, "channel_order_id": channel_order_id, "items": len(items)}
+    except Exception as e:
+        order["db_sync_error"] = str(e)
+        order["localStorage_payload"] = _local_storage_payload(order)
+        logger.error("Failed to sync WhatsApp order %s to database: %s", order.get("id"), e)
+        return None
+
+
+def _update_persisted_whatsapp_order(order: dict, updates: dict) -> None:
+    if not _has_supabase_config():
+        return
+    db_order_id = order.get("db_order_id")
+    if not db_order_id:
+        _persist_whatsapp_order(order)
+        db_order_id = order.get("db_order_id")
+    if not db_order_id:
+        return
+    try:
+        db = get_db()
+        db.table("orders").update({
+            **updates,
+            "raw_payload": order,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }).eq("id", db_order_id).execute()
+    except Exception as e:
+        logger.warning("Could not update persisted WhatsApp order %s: %s", db_order_id, e)
 
 
 # ── Bridge process state ──────────────────────────────────────────────────────
@@ -295,10 +511,69 @@ def _resolve_jid_aliases(phone_jid: str) -> List[str]:
     return jids
 
 
+def _normalise_message_timestamp(value) -> str:
+    if value is None or value == "":
+        return datetime.now(timezone.utc).isoformat()
+    if isinstance(value, (int, float)):
+        ts = float(value)
+        if ts > 10_000_000_000:
+            ts = ts / 1000
+        return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+    text = str(value)
+    if text.isdigit():
+        return _normalise_message_timestamp(int(text))
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.isoformat()
+    except Exception:
+        return datetime.now(timezone.utc).isoformat()
+
+
+def _buffer_whatsapp_message(
+    chat_jid: str,
+    message_id: Optional[str],
+    sender: Optional[str],
+    text: str,
+    timestamp=None,
+    is_from_me: bool = False,
+    chat_name: Optional[str] = None,
+) -> bool:
+    """Write a bridge message into the scanner SQLite store. Returns True for a new row."""
+    if not chat_jid or not text:
+        return False
+    msg_id = message_id or str(uuid.uuid4())
+    ts = _normalise_message_timestamp(timestamp)
+    name = chat_name or sender or chat_jid.split("@")[0]
+    inserted = False
+    try:
+        conn = sqlite3.connect(WHATSAPP_DB_PATH)
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT OR IGNORE INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)",
+            (chat_jid, name, ts),
+        )
+        cur.execute(
+            "UPDATE chats SET name = COALESCE(NULLIF(?, ''), name), last_message_time = ? WHERE jid = ?",
+            (name, ts, chat_jid),
+        )
+        cur.execute(
+            """INSERT OR IGNORE INTO messages (id, chat_jid, sender, content, timestamp, is_from_me)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (msg_id, chat_jid, sender or name, text, ts, 1 if is_from_me else 0),
+        )
+        inserted = cur.rowcount > 0
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.warning("Could not buffer WhatsApp message %s for %s: %s", msg_id, chat_jid, e)
+    return inserted
+
+
 def _wa_list_chats(query: Optional[str] = None, limit: int = 50) -> List[dict]:
     """
-    Return chats with real contact names from whatsmeow_contacts (device DB).
-    Falls back to messages DB `chats` table if device DB unavailable.
+    Return chats visible to the bridge/device and the local message buffer.
     Filters: no @lid, no @broadcast, no @newsletter.
     Formats Indian phone numbers as +91 XXXXX XXXXX.
     """
@@ -311,86 +586,77 @@ def _wa_list_chats(query: Optional[str] = None, limit: int = 50) -> List[dict]:
             return f"+91 {raw[:5]} {raw[5:]}"
         return raw
 
-    # 1. Load contact name map from whatsmeow_contacts (device DB)
-    contact_names: dict = {}
+    rows = []
+    seen_jids: set = set()
+
+    def _include(jid: str) -> bool:
+        if not jid:
+            return False
+        blocked = ("@lid", "@broadcast", "@newsletter", "status@broadcast")
+        if any(x in jid for x in blocked):
+            return False
+        return jid.endswith("@s.whatsapp.net") or jid.endswith("@g.us")
+
+    def _append_chat(jid: str, name: str = "", last_message_time: Optional[str] = None) -> None:
+        if not _include(jid) or jid in seen_jids:
+            return
+        phone_raw = jid.replace("@s.whatsapp.net", "").replace("@g.us", "")
+        is_group = jid.endswith("@g.us")
+        phone_display = "" if is_group else _fmt_phone(phone_raw)
+        display_name = name or (f"Group {phone_raw[:12]}" if is_group else phone_display)
+        if query:
+            q_lower = query.lower()
+            haystack = f"{display_name} {phone_display} {jid}".lower()
+            if q_lower not in haystack:
+                return
+        seen_jids.add(jid)
+        rows.append({
+            "jid": jid,
+            "name": display_name,
+            "phone": phone_display,
+            "is_group": is_group,
+            "last_message_time": last_message_time,
+        })
+
+    # 1. Contacts from whatsmeow device DB if a Go bridge was used previously.
     try:
         device_conn = sqlite3.connect(WHATSAPP_DEVICE_DB)
         device_conn.row_factory = sqlite3.Row
         dc = device_conn.cursor()
         dc.execute("SELECT their_jid, full_name, push_name, first_name FROM whatsmeow_contacts")
         for r in dc.fetchall():
-            jid = r["their_jid"]
-            name = r["full_name"] or r["push_name"] or r["first_name"] or ""
-            if name:
-                contact_names[jid] = name
+            _append_chat(r["their_jid"], r["full_name"] or r["push_name"] or r["first_name"] or "")
         device_conn.close()
     except Exception as e:
-        logger.warning("Could not load contact names from device DB: %s", e)
+        logger.debug("Could not load contact names from device DB: %s", e)
 
-    # 2. Build rows from contact_names (whatsmeow_contacts) — these are real contacts
-    rows = []
-    seen_jids: set = set()
+    # 2. Baileys bridge in-memory/persisted chat list.
+    try:
+        resp = httpx.get(f"{BRIDGE_API}/api/chats", params={"q": query or "", "limit": max(limit, 100)}, timeout=4.0)
+        if resp.status_code == 200:
+            for c in resp.json().get("chats", []):
+                _append_chat(c.get("jid", ""), c.get("name", ""), c.get("last_message_time"))
+    except Exception as e:
+        logger.debug("Could not load chats from bridge API: %s", e)
 
-    # First: individual contacts (DMs) from the contacts table
-    for jid, name in contact_names.items():
-        if not jid.endswith("@s.whatsapp.net"):
-            continue
-        seen_jids.add(jid)
-        phone_raw = jid.replace("@s.whatsapp.net", "")
-        phone_display = _fmt_phone(phone_raw)
-        display_name = name or phone_display
-
-        if query:
-            q_lower = query.lower()
-            if q_lower not in display_name.lower() and q_lower not in phone_display.lower():
-                continue
-
-        rows.append({
-            "jid": jid,
-            "name": display_name,
-            "phone": phone_display,
-            "is_group": False,
-            "last_message_time": None,
-        })
-
-    # Sort DMs alphabetically by name
-    rows.sort(key=lambda r: r["name"].lower())
-
-    # Then: groups from messages DB chats table
+    # 3. Local buffered chats from live incoming messages and wa_scanner.py.
     try:
         conn = sqlite3.connect(WHATSAPP_DB_PATH)
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
         cur.execute(
             """SELECT jid, name, last_message_time FROM chats
-               WHERE jid LIKE '%@g.us'
-               ORDER BY last_message_time DESC LIMIT ?""",
-            (100,),
+               ORDER BY COALESCE(last_message_time, '') DESC LIMIT ?""",
+            (max(limit, 200),),
         )
         for r in cur.fetchall():
             row = dict(r)
-            jid = row.get("jid", "")
-            if jid in seen_jids:
-                continue
-            seen_jids.add(jid)
-            chat_name = row.get("name") or f"Group {jid.split('@')[0][:12]}"
-
-            if query:
-                q_lower = query.lower()
-                if q_lower not in chat_name.lower():
-                    continue
-
-            rows.append({
-                "jid": jid,
-                "name": chat_name,
-                "phone": "",
-                "is_group": True,
-                "last_message_time": row.get("last_message_time"),
-            })
+            _append_chat(row.get("jid", ""), row.get("name") or "", row.get("last_message_time"))
         conn.close()
     except Exception as e:
-        logger.error("WhatsApp DB groups error: %s", e)
+        logger.error("WhatsApp DB chats error: %s", e)
 
+    rows.sort(key=lambda r: (r.get("last_message_time") or "", r["name"].lower()), reverse=True)
     return rows[:limit]
 
 
@@ -562,7 +828,7 @@ def _detect_order_intent(message_text: str, products: List[dict]) -> Optional[di
                         except (ValueError, IndexError):
                             pass
                         break
-                if not any(item["product"]["id"] == p["id"] for item in matched_items):
+                if not any(item["product"].get("id") == p.get("id") for item in matched_items):
                     matched_items.append({
                         "product": p,
                         "qty": qty
@@ -610,7 +876,13 @@ def _detect_order_intent(message_text: str, products: List[dict]) -> Optional[di
             "qty": qty,
             "price_hint": price_hint,
             "confidence": round(confidence, 2),
-            "items": [{"name": matched.get("name"), "product_id": matched.get("id"), "qty": qty, "price": matched.get("price") or 0.0}]
+            "items": [{
+                "name": matched.get("name"),
+                "product_id": matched.get("id"),
+                "sku": matched.get("sku"),
+                "qty": qty,
+                "price": matched.get("price") or 0.0,
+            }]
         }
 
     # Aggregate matched items
@@ -623,6 +895,7 @@ def _detect_order_intent(message_text: str, products: List[dict]) -> Optional[di
         items_list.append({
             "name": p.get("name"),
             "product_id": p.get("id"),
+            "sku": p.get("sku"),
             "qty": qty,
             "price": price
         })
@@ -653,11 +926,39 @@ def _get_products() -> List[dict]:
     if _synced_products:
         return _synced_products
     try:
-        from ..database import get_db
         db = get_db()
-        result = db.table("products").select("id, name, sku, price, stock").limit(200).execute()
+        result = db.table("products").select("id, name, skus(sku, selling_price), inventory(qty_available, qty_on_hand)").limit(200).execute()
         if result.data:
-            return result.data
+            products = []
+            for row in result.data:
+                sku_rows = row.get("skus") or []
+                inv_rows = row.get("inventory") or []
+                sku_row = sku_rows[0] if isinstance(sku_rows, list) and sku_rows else {}
+                inv_row = inv_rows[0] if isinstance(inv_rows, list) and inv_rows else {}
+                products.append({
+                    "id": row.get("id"),
+                    "name": row.get("name", ""),
+                    "sku": sku_row.get("sku"),
+                    "price": _safe_float(sku_row.get("selling_price")),
+                    "stock": _safe_nonnegative_int(inv_row.get("qty_available"), _safe_nonnegative_int(inv_row.get("qty_on_hand"), 0)),
+                })
+            return products
+    except Exception:
+        pass
+    try:
+        db = get_db()
+        result = db.table("skus").select("sku, name, selling_price, mrp").limit(200).execute()
+        if result.data:
+            return [
+                {
+                    "id": r.get("sku"),
+                    "name": r.get("name", ""),
+                    "sku": r.get("sku"),
+                    "price": _safe_float(r.get("selling_price"), _safe_float(r.get("mrp"))),
+                    "stock": 99,
+                }
+                for r in result.data
+            ]
     except Exception:
         pass
     return []
@@ -675,14 +976,30 @@ def _get_product_by_name(name: str) -> Optional[dict]:
 
 
 def _deduct_stock(product_id: str, qty: int) -> None:
+    if not product_id or not _has_supabase_config():
+        return
     try:
-        from ..database import get_db
         db = get_db()
-        result = db.table("products").select("stock").eq("id", product_id).single().execute()
-        current = (result.data or {}).get("stock", 0)
-        db.table("products").update({"stock": max(0, current - qty)}).eq("id", product_id).execute()
+        product = _get_product_by_id(product_id)
+        sku = product.get("sku") if product else None
+        if not sku:
+            sku_row = db.table("skus").select("sku").eq("product_id", product_id).limit(1).execute()
+            if sku_row.data:
+                sku = sku_row.data[0].get("sku")
+        if sku:
+            result = db.table("inventory").select("qty_on_hand").eq("sku", sku).maybe_single().execute()
+            if result.data:
+                current = _safe_nonnegative_int(result.data.get("qty_on_hand"))
+                db.table("inventory").update({"qty_on_hand": max(0, current - _safe_int(qty))}).eq("sku", sku).execute()
+            return
+
+        # Legacy fallback for older local schemas that stored stock on products.
+        result = db.table("products").select("stock").eq("id", product_id).maybe_single().execute()
+        if result.data and "stock" in result.data:
+            current = _safe_nonnegative_int(result.data.get("stock"))
+            db.table("products").update({"stock": max(0, current - _safe_int(qty))}).eq("id", product_id).execute()
     except Exception as e:
-        logger.warning("Could not deduct stock for %s: %s", product_id, e)
+        logger.debug("Could not deduct stock for %s: %s", product_id, e)
 
 
 # ── Draft reply builder ───────────────────────────────────────────────────────
@@ -719,10 +1036,15 @@ def _create_draft_reply(detection: dict) -> dict:
                 f"Reply *YES* to confirm your order.\n"
                 f"Total: *₹{total}*"
             )
+            available_items = []
+            for item in items:
+                product = _get_product_by_id(item.get("product_id")) if item.get("product_id") else None
+                if product and product.get("stock", 0) > 0:
+                    available_items.append(item)
             _conversation_states[detection["chat_jid"]] = {
                 "state": "waiting_confirm",
                 "detection_id": detection["id"],
-                "items": [item for item in items if _get_product_by_id(item.get("product_id")).get("stock", 0) > 0],
+                "items": available_items,
                 "total": total,
                 "sent_at": None,
                 "qty": sum(item.get("qty", 1) for item in items),
@@ -816,6 +1138,11 @@ def _create_draft_reply(detection: dict) -> dict:
 def _generate_and_send_payment_link(order: dict) -> None:
     try:
         from .payments import _rz_auth, RAZORPAY_BASE
+
+        _persist_whatsapp_order(order)
+        if _has_supabase_config() and not order.get("db_order_id"):
+            logger.warning("Skipping payment link for %s because database sync did not complete", order.get("id"))
+            return
         
         amount = float(order.get("total") or order.get("price", 0.0))
         if amount <= 0:
@@ -824,7 +1151,8 @@ def _generate_and_send_payment_link(order: dict) -> None:
         customer_name = order.get("customer_name", "Customer")
         chat_jid = order.get("chat_jid")
         phone = chat_jid.split("@")[0].split("-")[0] if chat_jid else ""
-        order_id = order.get("id")
+        order_id = order.get("db_order_id") or order.get("id")
+        channel_order_id = order.get("channel_order_id") or order.get("id")
         
         # Fallback check for Razorpay credentials
         try:
@@ -837,7 +1165,9 @@ def _generate_and_send_payment_link(order: dict) -> None:
             # Demo mode / missing credentials fallback
             short_url = f"https://rzp.io/i/mock-{order_id}"
             order["payment_link"] = short_url
+            order["localStorage_payload"] = _local_storage_payload(order)
             _persist_all()
+            _update_persisted_whatsapp_order(order, {"payment_link": short_url})
             
             wa_message = (
                 f"Thank you for confirming your order, {customer_name.split()[0]}! 🎉\n\n"
@@ -884,6 +1214,7 @@ def _generate_and_send_payment_link(order: dict) -> None:
             "reminder_enable": True,
             "notes": {
                 "order_id": order_id,
+                "channel_order_id": channel_order_id,
                 "source": "whatsapp_bot",
             },
             "callback_url": f"{get_settings().app_base_url}/api/payments/webhook",
@@ -905,7 +1236,12 @@ def _generate_and_send_payment_link(order: dict) -> None:
 
         order["payment_link"] = short_url
         order["payment_link_id"] = data.get("id")
+        order["localStorage_payload"] = _local_storage_payload(order)
         _persist_all()
+        _update_persisted_whatsapp_order(order, {
+            "payment_link": short_url,
+            "payment_link_id": data.get("id"),
+        })
 
         wa_message = (
             f"Thank you for confirming your order, {customer_name.split()[0]}! 🎉\n\n"
@@ -979,6 +1315,7 @@ def _create_confirmed_order(chat_jid: str) -> Optional[dict]:
     }
     _detected_orders.append(order)
     _conversation_states[chat_jid]["state"] = "idle"
+    _persist_whatsapp_order(order)
     _persist_all()
 
     # Generate and send Razorpay payment link automatically
@@ -986,14 +1323,7 @@ def _create_confirmed_order(chat_jid: str) -> Optional[dict]:
 
     return {
         "order": order,
-        "localStorage_payload": {
-            "customer": customer_name,
-            "items": items,
-            "price": price,
-            "status": "new",
-            "channel": "whatsapp",
-            "chat_jid": chat_jid,
-        },
+        "localStorage_payload": _local_storage_payload(order),
     }
 
 
@@ -1228,6 +1558,7 @@ def _check_for_customer_confirmation(chat_jid: str, text: str, msg: dict) -> Non
     if state:
         _conversation_states[chat_jid]["state"] = "idle"
 
+    _persist_whatsapp_order(order)
     _persist_all()
     logger.info("Inbound confirmation: order %s created for %s product=%s", order["id"], customer_name, product_hint)
     
@@ -1317,6 +1648,10 @@ def _create_confirmed_order_from_broadcast(jid: str, broadcast: dict) -> Optiona
     product_id = broadcast.get("product_id", "")
     price = broadcast.get("price", 0.0)
     qty = broadcast.get("qty", 1)
+    product = _get_product_by_id(product_id) if product_id else None
+    sku = product.get("sku") if product else broadcast.get("sku")
+    if product and not price:
+        price = product.get("price", 0.0)
 
     now_iso = datetime.now(timezone.utc).isoformat()
     order = {
@@ -1330,7 +1665,7 @@ def _create_confirmed_order_from_broadcast(jid: str, broadcast: dict) -> Optiona
         "qty": qty,
         "price": price,
         "catalog_price": price,
-        "items": [{"name": product_name, "product_id": product_id, "qty": qty, "price": price}],
+        "items": [{"name": product_name, "product_id": product_id, "sku": sku, "qty": qty, "price": price}],
         "total": price * qty,
         "confidence": 1.0,
         "status": "confirmed",
@@ -1342,6 +1677,7 @@ def _create_confirmed_order_from_broadcast(jid: str, broadcast: dict) -> Optiona
         "notes": "Auto-confirmed via WhatsApp YES reply",
     }
     _detected_orders.append(order)
+    _persist_whatsapp_order(order)
     _persist_all()
     logger.info("Order created from broadcast: %s customer=%s product=%s", order["id"], customer_name, product_name)
     
@@ -1504,11 +1840,13 @@ def _scan_self_sent_confirmations() -> dict:
                     "notes": f"Offer: '{text[:80]}' → YES: '{follow_text}'",
                 }
                 _detected_orders.append(order)
+                _persist_whatsapp_order(order)
                 confirmed_ts_by_jid[jid] = yes_dt.isoformat()
                 created += 1
                 orders_created.append(order)
                 logger.info("Self-sent confirmation detected: order %s jid=%s product=%s price=%.0f", order["id"], jid, product_name, price)
                 _persist_all()
+                _generate_and_send_payment_link(order)
                 break  # one YES per offer
 
     return {"created": created, "orders": orders_created}
@@ -1654,6 +1992,10 @@ async def start_bridge_endpoint():
     # If an external bridge URL is configured, don't try to spawn a local process
     external = os.environ.get("WHATSAPP_BRIDGE_API", "").strip()
     if external and external != "http://localhost:8080":
+        try:
+            httpx.post(f"{BRIDGE_API}/api/connect", timeout=5.0)
+        except Exception as e:
+            logger.debug("Could not trigger external WhatsApp bridge connect: %s", e)
         running = _is_bridge_running()
         return {"started": False, "message": "Using external bridge", "authenticated": _is_bridge_authenticated(), "bridge_running": running}
 
@@ -1819,22 +2161,18 @@ async def confirm_order(payload: ConfirmOrderPayload):
         raise HTTPException(status_code=409, detail=f"Order already {order['status']}")
     order["status"] = "confirmed"
     order["confirmed_at"] = datetime.now(timezone.utc).isoformat()
-    _persist_all()
-    ls_order = {
-        "customer": order["customer_name"],
-        "items": [{
-            "name": order["product_hint"] or "WhatsApp Order",
+    if not order.get("items"):
+        order["items"] = [{
+            "name": order.get("product_hint") or "WhatsApp Order",
             "product_id": order.get("product_id"),
             "sku": order.get("product_sku"),
-            "qty": order["qty"],
-            "unit_price": order.get("catalog_price", 0),
-        }],
-        "price": (order.get("catalog_price") or 0) * order["qty"],
-        "status": "new",
-        "channel": "whatsapp",
-        "source_message": order["message_text"],
-        "chat_jid": order["chat_jid"],
-    }
+            "qty": order.get("qty", 1),
+            "price": order.get("catalog_price") or order.get("price") or 0,
+        }]
+    order["total"] = _order_total(order)
+    _persist_whatsapp_order(order)
+    _persist_all()
+    ls_order = _local_storage_payload(order)
     return {"status": "confirmed", "order": order, "localStorage_payload": ls_order}
 
 
@@ -1881,6 +2219,17 @@ async def send_direct(payload: DirectMessagePayload):
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Send failed: {e}")
 
+    sent_at = datetime.now(timezone.utc).isoformat()
+    _buffer_whatsapp_message(
+        chat_jid=payload.jid,
+        message_id=f"out-{uuid.uuid4()}",
+        sender="me",
+        text=payload.message,
+        timestamp=sent_at,
+        is_from_me=True,
+        chat_name=payload.customer_name or payload.jid,
+    )
+
     # ── Register waiting_confirm state so YES reply triggers order creation ──
     if payload.track_reply and payload.product_name:
         jid = payload.jid
@@ -1905,7 +2254,7 @@ async def send_direct(payload: DirectMessagePayload):
             "product_id": payload.product_id or "",
             "price": payload.price or 0.0,
             "qty": payload.qty or 1,
-            "sent_at": datetime.now(timezone.utc).isoformat(),
+            "sent_at": sent_at,
             "source": "crm_broadcast",
             "confirmed": False,
             "last_confirmed_message_ts": None,  # tracks last YES timestamp seen
@@ -1981,6 +2330,15 @@ async def send_reply(payload: ReplyIdPayload):
     reply["sent_at"] = sent_at
 
     jid = reply["chat_jid"]
+    _buffer_whatsapp_message(
+        chat_jid=jid,
+        message_id=f"out-{uuid.uuid4()}",
+        sender="me",
+        text=reply["draft_message"],
+        timestamp=sent_at,
+        is_from_me=True,
+        chat_name=reply.get("customer_name") or jid,
+    )
     if jid in _conversation_states:
         _conversation_states[jid]["sent_at"] = sent_at
 
@@ -2161,22 +2519,40 @@ async def confirm_from_wa(payload: ConfirmFromWAPayload):
         raise HTTPException(status_code=404, detail="Confirmation not found")
     conf["confirmed"] = True
     conf["manually_confirmed_at"] = datetime.now(timezone.utc).isoformat()
-    _persist_all()
     if conf.get("product_id"):
         _deduct_stock(conf["product_id"], conf.get("qty", 1))
-    ls_order = {
-        "customer": conf["customer_name"],
+    now_iso = datetime.now(timezone.utc).isoformat()
+    channel_order_id = f"WA-{uuid.uuid4().hex[:8].upper()}"
+    order = {
+        "id": channel_order_id,
+        "channel": "whatsapp",
+        "channel_order_id": channel_order_id,
+        "chat_jid": conf["chat_jid"],
+        "customer_name": conf.get("customer_name", "Customer"),
+        "customer_phone": _phone_from_jid(conf.get("chat_jid", "")),
+        "message_text": "Manual WhatsApp confirmation",
+        "product_hint": conf.get("product_hint", "WhatsApp Order"),
+        "product_id": conf.get("product_id"),
+        "qty": conf.get("qty", 1),
+        "price": conf.get("price") or 0,
+        "catalog_price": conf.get("price") or 0,
+        "total": (conf.get("price") or 0) * conf.get("qty", 1),
         "items": [{
             "name": conf.get("product_hint", "WhatsApp Order"),
             "product_id": conf.get("product_id"),
             "qty": conf.get("qty", 1),
-            "unit_price": conf.get("price") or 0,
+            "price": conf.get("price") or 0,
         }],
-        "price": (conf.get("price") or 0) * conf.get("qty", 1),
-        "status": "new",
-        "channel": "whatsapp",
-        "chat_jid": conf["chat_jid"],
+        "confidence": 1.0,
+        "status": "confirmed",
+        "detected_at": now_iso,
+        "confirmed_at": now_iso,
+        "source": "whatsapp_manual_confirmation",
     }
+    _detected_orders.append(order)
+    _persist_whatsapp_order(order)
+    _persist_all()
+    ls_order = _local_storage_payload(order)
     return {"status": "confirmed", "confirmation": conf, "localStorage_payload": ls_order}
 
 
@@ -2242,6 +2618,17 @@ async def broadcast_bulk(payload: BroadcastBulkPayload):
             failed.append({"jid": jid, "error": str(e)})
             continue
 
+        sent_at = datetime.now(timezone.utc).isoformat()
+        _buffer_whatsapp_message(
+            chat_jid=jid,
+            message_id=f"out-{uuid.uuid4()}",
+            sender="me",
+            text=message,
+            timestamp=sent_at,
+            is_from_me=True,
+            chat_name=contact_name,
+        )
+
         if payload.track_reply and payload.product_name:
             if not any(c["chat_jid"] == jid for c in _monitored_chats):
                 _monitored_chats.append({
@@ -2259,7 +2646,7 @@ async def broadcast_bulk(payload: BroadcastBulkPayload):
                 "product_id": payload.product_id or "",
                 "price": payload.price or 0.0,
                 "qty": payload.qty or 1,
-                "sent_at": datetime.now(timezone.utc).isoformat(),
+                "sent_at": sent_at,
                 "source": "broadcast_bulk",
                 "confirmed": False,
                 "last_confirmed_message_ts": None,
@@ -2358,6 +2745,17 @@ async def share_catalog_item(payload: SharePayload):
             failed.append({"jid": jid, "error": str(e)})
             continue
 
+        sent_at = datetime.now(timezone.utc).isoformat()
+        _buffer_whatsapp_message(
+            chat_jid=jid,
+            message_id=f"out-{uuid.uuid4()}",
+            sender="me",
+            text=message,
+            timestamp=sent_at,
+            is_from_me=True,
+            chat_name=contact_name,
+        )
+
         if payload.track_reply:
             if not any(c["chat_jid"] == jid for c in _monitored_chats):
                 _monitored_chats.append({
@@ -2373,7 +2771,7 @@ async def share_catalog_item(payload: SharePayload):
                 "product_id": payload.product_id,
                 "price": product.get("selling_price") or 0.0,
                 "qty": 1,
-                "sent_at": datetime.now(timezone.utc).isoformat(),
+                "sent_at": sent_at,
                 "source": "share",
                 "confirmed": False,
                 "last_confirmed_message_ts": None,
@@ -2406,15 +2804,13 @@ async def share_catalog_item(payload: SharePayload):
 # ------------------------------------------------------------------ #
 
 class IncomingMessagePayload(BaseModel):
-    from_: str = ""
+    from_: str = Field(default="", alias="from")
     body: str = ""
-    timestamp: Optional[int] = None
+    timestamp: Optional[Any] = None
     message_id: Optional[str] = None
     order_data: Optional[dict] = None
 
-    class Config:
-        populate_by_name = True
-        fields = {"from_": "from"}
+    model_config = {"populate_by_name": True}
 
 
 @router.post("/incoming")
@@ -2429,36 +2825,74 @@ async def incoming_message(payload: IncomingMessagePayload):
 
     from_jid = payload.from_ if "@" in payload.from_ else f"{payload.from_}@s.whatsapp.net"
     body = payload.body or ""
+    timestamp_iso = _normalise_message_timestamp(payload.timestamp)
+
+    if body:
+        _buffer_whatsapp_message(
+            chat_jid=from_jid,
+            message_id=payload.message_id,
+            sender=from_jid,
+            text=body,
+            timestamp=timestamp_iso,
+            is_from_me=False,
+            chat_name=from_jid.split("@")[0],
+        )
+        if not any(c["chat_jid"] == from_jid for c in _monitored_chats):
+            _monitored_chats.append({
+                "chat_jid": from_jid,
+                "chat_name": from_jid.split("@")[0],
+                "customer_name": from_jid.split("@")[0],
+                "added_at": datetime.now(timezone.utc).isoformat(),
+                "last_scanned": None,
+                "order_count": 0,
+                "source": "baileys_incoming",
+            })
+            _save_json(_CHATS_FILE, _monitored_chats)
 
     # Handle WhatsApp order (product card tap)
     if payload.order_data:
         items = payload.order_data.get("product_items") or payload.order_data.get("products", [])
         if items:
-            total = sum(
-                float(i.get("item_price", 0) or i.get("price", 0)) * int(i.get("quantity", 1))
-                for i in items
-            )
-            fake_order = {
-                "jid": from_jid,
+            normalised_items = []
+            for item in items:
+                sku = item.get("product_retailer_id") or item.get("sku")
+                normalised_items.append({
+                    "name": item.get("name") or sku or "WhatsApp Product",
+                    "sku": sku,
+                    "channel_sku_id": sku,
+                    "qty": _safe_int(item.get("quantity"), 1),
+                    "price": _safe_float(item.get("item_price"), _safe_float(item.get("price"))),
+                })
+            total = _total_for_items(normalised_items)
+            now_iso = datetime.now(timezone.utc).isoformat()
+            channel_order_id = f"WA-{uuid.uuid4().hex[:8].upper()}"
+            order = {
+                "id": channel_order_id,
+                "channel": "whatsapp",
+                "channel_order_id": channel_order_id,
+                "chat_jid": from_jid,
                 "customer_name": from_jid.split("@")[0],
-                "product_name": items[0].get("product_retailer_id", "Product"),
+                "customer_phone": _phone_from_jid(from_jid),
+                "message_text": body or "WhatsApp product-card order",
+                "product_hint": normalised_items[0]["name"] if normalised_items else "WhatsApp Order",
+                "items": normalised_items,
+                "qty": sum(i["qty"] for i in normalised_items),
                 "price": total,
-                "qty": sum(int(i.get("quantity", 1)) for i in items),
+                "total": total,
+                "catalog_price": normalised_items[0]["price"] if normalised_items else 0,
+                "confidence": 1.0,
+                "status": "confirmed",
+                "detected_at": now_iso,
+                "confirmed_at": now_iso,
+                "message_id": payload.message_id or str(uuid.uuid4()),
+                "source": "whatsapp_product_card",
+                "raw_order_data": payload.order_data,
             }
-            _pending_broadcasts.append({
-                "id": str(uuid.uuid4()),
-                "jid": from_jid,
-                "customer_name": fake_order["customer_name"],
-                "product_name": fake_order["product_name"],
-                "price": total,
-                "qty": fake_order["qty"],
-                "sent_at": datetime.now(timezone.utc).isoformat(),
-                "source": "product_card",
-                "confirmed": False,
-                "last_confirmed_message_ts": None,
-            })
+            _detected_orders.append(order)
+            _persist_whatsapp_order(order)
             _persist_all()
-            return {"status": "order_queued", "total": total}
+            _generate_and_send_payment_link(order)
+            return {"status": "order_confirmed", "total": total, "order": order}
 
     # Text message — run through order intent detection
     if body:
@@ -2475,17 +2909,18 @@ async def incoming_message(payload: IncomingMessagePayload):
                         bc["confirmed_at"] = datetime.now(timezone.utc).isoformat()
                         _persist_all()
                     return {"status": "order_confirmed"}
-        else:
-            # Add to monitored chats and run scan
-            if not any(c["chat_jid"] == from_jid for c in _monitored_chats):
-                _monitored_chats.append({
-                    "chat_jid": from_jid,
-                    "chat_name": from_jid.split("@")[0],
-                    "customer_name": from_jid.split("@")[0],
-                    "added_at": datetime.now(timezone.utc).isoformat(),
-                    "source": "baileys_incoming",
-                })
-                _persist_all()
+
+            _check_for_customer_confirmation(from_jid, body, {
+                "id": payload.message_id or str(uuid.uuid4()),
+                "timestamp": timestamp_iso,
+                "text": body,
+                "sender": from_jid,
+            })
+            _persist_all()
+            return {"status": "confirmation_checked"}
+
+        scan_result = _run_scan_and_draft(from_jid)
+        return {"status": "buffered", **scan_result}
 
     return {"status": "ok"}
 
