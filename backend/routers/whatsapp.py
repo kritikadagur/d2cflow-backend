@@ -1959,6 +1959,34 @@ class DirectMessagePayload(BaseModel):
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
+@router.get("/connect", response_class=None)
+async def whatsapp_connect_page():
+    """Simple HTML page that shows the QR code — no React needed."""
+    from fastapi.responses import HTMLResponse
+    d = await bridge_status()
+    qr_data = (d.get("qr_b64") or "").replace("qr:", "", 1)
+    if d.get("connected"):
+        body = "<div class='ok'>✅ WhatsApp Connected!</div>"
+    elif qr_data:
+        body = f"""
+        <p>Open WhatsApp → Linked Devices → Link a Device → scan:</p>
+        <div id="qr"></div>
+        <p style="color:#888;font-size:13px">This page auto-refreshes every 5s</p>
+        <script src="https://cdn.jsdelivr.net/npm/qrcode/build/qrcode.min.js"></script>
+        <script>QRCode.toCanvas(document.createElement('canvas'),{repr(qr_data)},function(e,c){{if(!e){{document.getElementById('qr').appendChild(c);}}}});</script>
+        <meta http-equiv="refresh" content="5">"""
+    else:
+        body = "<div class='warn'>⏳ Bridge starting… <a href=''>Refresh</a></div>"
+
+    html = f"""<!DOCTYPE html><html><head><meta charset='utf-8'>
+    <title>Connect WhatsApp</title>
+    <style>body{{font-family:sans-serif;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;margin:0;background:#f8f9fa}}
+    h2{{color:#1e293b}}canvas{{border:3px solid #25D366;border-radius:12px;padding:8px}}
+    .ok{{font-size:24px;color:#166534}}.warn{{font-size:18px;color:#92400e}}</style>
+    </head><body><h2>💬 Connect WhatsApp</h2>{body}</body></html>"""
+    return HTMLResponse(html)
+
+
 @router.get("/bridge-status")
 async def bridge_status():
     running = _is_bridge_running()
