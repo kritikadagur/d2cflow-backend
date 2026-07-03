@@ -366,7 +366,7 @@ _bridge_lock = threading.Lock()
 
 def _is_bridge_running() -> bool:
     try:
-        httpx.get(f"{BRIDGE_API}/", timeout=5.0)
+        httpx.get(f"{BRIDGE_API}/", timeout=3.0)
         return True
     except httpx.ConnectError:
         return False
@@ -377,7 +377,7 @@ def _is_bridge_running() -> bool:
 def _is_bridge_authenticated() -> bool:
     # First try the Baileys Node bridge /api/status endpoint
     try:
-        resp = httpx.get(f"{BRIDGE_API}/api/status", timeout=8.0)
+        resp = httpx.get(f"{BRIDGE_API}/api/status", timeout=5.0)
         if resp.status_code == 200:
             data = resp.json()
             if data.get("connected"):
