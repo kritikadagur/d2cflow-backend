@@ -5,5 +5,8 @@
   ],
   "routes": [
     { "src": "/(.*)", "dest": "/api/index.py" }
-  ]
+  ],
+  "env": {
+    "WHATSAPP_BRIDGE_API": "https://d2cflow-backend-1.onrender.com"
+  }
 }
