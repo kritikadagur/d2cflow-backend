@@ -1956,29 +1956,60 @@ class DirectMessagePayload(BaseModel):
 
 @router.get("/connect", response_class=None)
 async def whatsapp_connect_page():
-    """Simple HTML page that shows the QR code — no React needed."""
+    """QR page that polls bridge-status in-place; no meta-refresh during scan."""
     from fastapi.responses import HTMLResponse
-    d = await bridge_status()
-    qr_data = (d.get("qr_b64") or "").replace("qr:", "", 1)
-    if d.get("connected"):
-        body = "<div class='ok'>✅ WhatsApp Connected!</div>"
-    elif qr_data:
-        body = f"""
-        <p>Open WhatsApp → Linked Devices → Link a Device → scan:</p>
-        <div id="qr"></div>
-        <p style="color:#888;font-size:13px">This page auto-refreshes every 5s</p>
-        <script src="https://cdn.jsdelivr.net/npm/qrcode/build/qrcode.min.js"></script>
-        <script>QRCode.toCanvas(document.createElement('canvas'),{repr(qr_data)},function(e,c){{if(!e){{document.getElementById('qr').appendChild(c);}}}});</script>
-        <meta http-equiv="refresh" content="5">"""
-    else:
-        body = "<div class='warn'>⏳ Bridge starting… <a href=''>Refresh</a></div>"
+    html = """<!DOCTYPE html><html><head><meta charset='utf-8'>
+<title>Connect WhatsApp</title>
+<style>body{font-family:-apple-system,sans-serif;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;margin:0;background:#f8f9fa}
+h2{color:#1e293b;margin:0 0 8px}canvas{border:3px solid #25D366;border-radius:12px;padding:8px;background:#fff}
+.hint{color:#64748b;font-size:13px;margin:12px 0 4px}
+.ok{font-size:22px;color:#166534;font-weight:600}
+.warn{font-size:16px;color:#92400e}
+.age{color:#94a3b8;font-size:11px;font-family:ui-monospace,monospace}</style>
+<script src="https://cdn.jsdelivr.net/npm/qrcode/build/qrcode.min.js"></script>
+</head><body>
+<h2>💬 Connect WhatsApp</h2>
+<div id="body"><div class='warn'>⏳ Loading…</div></div>
+<div class='age' id='age'></div>
+<script>
+let lastQr = null, lastRenderAt = 0;
+const body = document.getElementById('body');
+const age  = document.getElementById('age');
 
-    html = f"""<!DOCTYPE html><html><head><meta charset='utf-8'>
-    <title>Connect WhatsApp</title>
-    <style>body{{font-family:sans-serif;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;margin:0;background:#f8f9fa}}
-    h2{{color:#1e293b}}canvas{{border:3px solid #25D366;border-radius:12px;padding:8px}}
-    .ok{{font-size:24px;color:#166534}}.warn{{font-size:18px;color:#92400e}}</style>
-    </head><body><h2>💬 Connect WhatsApp</h2>{body}</body></html>"""
+async function tick(){
+  try{
+    const r = await fetch('/api/whatsapp/bridge-status', {cache:'no-store'});
+    const d = await r.json();
+    if(d.connected){
+      body.innerHTML = "<div class='ok'>✅ WhatsApp connected</div>"
+        + "<div class='hint'>You can close this tab.</div>";
+      age.textContent = '';
+      return; // stop polling
+    }
+    const qr = (d.qr_b64 || '').replace(/^qr:/, '');
+    if(qr && qr !== lastQr){
+      lastQr = qr;
+      lastRenderAt = Date.now();
+      body.innerHTML =
+        "<p class='hint'>WhatsApp → ⋮ → Linked Devices → Link a Device → scan below</p>"
+      + "<canvas id='c'></canvas>";
+      QRCode.toCanvas(document.getElementById('c'), qr, {width:280, margin:1},
+        e => { if(e) body.innerHTML = "<div class='warn'>QR render error: "+e+"</div>"; });
+    } else if(!qr){
+      body.innerHTML = "<div class='warn'>⏳ Bridge starting… waiting for QR</div>";
+    }
+    if(lastRenderAt){
+      const s = Math.floor((Date.now()-lastRenderAt)/1000);
+      age.textContent = 'QR age: '+s+'s (auto-refreshes only when it rotates)';
+    }
+  }catch(e){
+    age.textContent = 'poll error: '+e;
+  }
+  setTimeout(tick, 3000);
+}
+tick();
+</script>
+</body></html>"""
     return HTMLResponse(html)
 
 
