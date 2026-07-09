@@ -367,6 +367,18 @@ alter table orders add column if not exists payment_link_id text;
 -- ── SKUs: extended columns from catalog importers ─────────────
 alter table skus add column if not exists selling_price            numeric(10,2);
 alter table skus add column if not exists product_id               uuid;
+-- Ensure the FK exists so PostgREST can embed products→skus→inventory.
+-- Bare `references products(id)` in the ADD COLUMN above is skipped when the
+-- column already exists on older DBs, so we add the constraint explicitly.
+do $$ begin
+  if not exists (
+    select 1 from pg_constraint where conname = 'skus_product_id_fkey'
+  ) then
+    alter table skus
+      add constraint skus_product_id_fkey
+      foreign key (product_id) references products(id) on delete set null;
+  end if;
+end $$;
 alter table skus add column if not exists barcode                  text;
 alter table skus add column if not exists color                    text;
 alter table skus add column if not exists size                     text;

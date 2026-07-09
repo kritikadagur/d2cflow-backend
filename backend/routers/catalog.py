@@ -386,37 +386,3 @@ def confirm_pdf_import(payload: ConfirmPdfImport, user=Depends(get_current_user)
         "skipped": skipped,
         "message": f"{created} products added to your catalog.",
     }
-
-
-# ------------------------------------------------------------------ #
-# One-shot PDF upload — parse + save in a single call (brief-compat)
-# ------------------------------------------------------------------ #
-
-@router.post("/upload")
-async def upload_pdf_catalog(file: UploadFile = File(...), user=Depends(get_current_user)):
-    """
-    Parse a PDF and persist products+SKUs in one call.
-    Prefer /import/pdf/preview + /import/pdf/confirm for a review step.
-    """
-    if not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="File must be a PDF")
-
-    contents = await file.read()
-    if len(contents) > 20 * 1024 * 1024:
-        raise HTTPException(status_code=400, detail="PDF too large. Max 20MB.")
-
-    try:
-        from ..catalog.pdf_importer import parse_pdf_catalog
-        parsed = parse_pdf_catalog(contents)
-    except ImportError:
-        raise HTTPException(status_code=503, detail="PDF parsing not available. Run: pip install pdfplumber")
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Could not parse PDF: {e}")
-
-    result = confirm_pdf_import(ConfirmPdfImport(products=parsed), user=user)
-    return {
-        "extracted": len(parsed),
-        "saved": result["created"],
-        "skipped": result["skipped"],
-        "products": [{"name": p.get("name"), "price": p.get("price"), "sku": p.get("sku")} for p in parsed],
-    }
