@@ -644,6 +644,42 @@ export default function ProductsPage() {
 
   const refresh = () => setProducts(getProducts());
 
+  // Hydrate from backend on mount — Supabase is source of truth
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch(`${BACKEND}/api/whatsapp/products`);
+        const data = await res.json();
+        if (cancelled || !data?.products) return;
+        // Merge backend products into localStorage, preserving user-added ones (matched by sku)
+        const local = getProducts();
+        const bySku = new Map(local.map(p => [p.sku, p]));
+        for (const p of data.products) {
+          bySku.set(p.sku, {
+            id: p.id || `PRD-${p.sku}`,
+            name: p.name,
+            sku: p.sku,
+            price: p.price || 0,
+            mrp: p.price || 0,
+            stock: p.stock || 0,
+            source: 'backend',
+            ...bySku.get(p.sku),   // preserve any local overrides
+            // but always take latest price/stock from backend
+            price: p.price || 0,
+            stock: p.stock || 0,
+          });
+        }
+        const merged = Array.from(bySku.values());
+        saveProducts(merged);
+        setProducts(merged);
+      } catch (e) {
+        console.warn('Products hydration failed:', e);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
   const handleAdd = form => {
     addProduct(form);
     refresh();

@@ -1,5 +1,5 @@
-import { useState, useCallback } from 'react';
-import { getOrders, addOrder, updateOrder } from '../data/orders';
+import { useState, useCallback, useEffect } from 'react';
+import { getOrders, saveOrders, addOrder, updateOrder } from '../data/orders';
 import { toast } from '../components/Toast';
 import { getProducts, decrementStock } from '../data/products';
 
@@ -703,6 +703,58 @@ export default function OrdersPage({ filterChannel }) {
   const PER_PAGE = 20;
 
   const refreshOrders = useCallback(() => setOrders(getOrders()), []);
+
+  // Hydrate from backend on mount
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const rows = await apiFetch('/api/orders');
+        if (cancelled || !Array.isArray(rows)) return;
+        // Normalise backend order rows into the localStorage schema
+        const normalised = rows.map(o => {
+          const raw = o.raw_payload || {};
+          const items = raw.items || [];
+          return {
+            id: o.channel_order_id || o.id,
+            db_id: o.id,
+            customer: o.customer_name || raw.customer_name || 'Unknown',
+            phone: o.customer_phone || '—',
+            city: (o.shipping_address && o.shipping_address.city) || '—',
+            state: o.state || '—',
+            pincode: o.pincode || '—',
+            channel: o.channel || 'manual',
+            payment: o.payment_mode || 'prepaid',
+            payment_status: o.payment_status || 'pending',
+            payment_link: o.payment_link,
+            payment_link_id: o.payment_link_id,
+            courier: o.courier,
+            awb: o.awb,
+            items: items.map(it => ({
+              name: it.name || 'Product',
+              sku: it.sku || it.product_id || '—',
+              qty: Number(it.qty) || 1,
+              price: Number(it.price ?? it.unit_price ?? 0),
+            })),
+            total: Number(o.total_amount || raw.total || 0),
+            status: o.status || 'new',
+            date: new Date(o.created_at).toLocaleDateString('en-IN', { day:'2-digit', month:'short', year:'numeric' }),
+            createdAt: o.created_at,
+          };
+        });
+        // Merge with any local-only orders (channel='manual' created via the UI)
+        const local = getOrders();
+        const seen = new Set(normalised.map(o => o.id));
+        const localOnly = local.filter(o => !seen.has(o.id));
+        const merged = [...normalised, ...localOnly];
+        saveOrders(merged);
+        setOrders(merged);
+      } catch (e) {
+        console.warn('Orders hydration failed:', e);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
 
   const STATUS_TREE = buildStatusTree(orders);
 
