@@ -101,12 +101,20 @@ function QRConnectScreen({ onConnected }) {
         {status === 'qr' && qrB64 && (
           <div>
             <div style={{ background: '#fff', border: '2px solid #25D366', borderRadius: 12, padding: 12, display: 'inline-block', marginBottom: 16 }}>
-              <QRCode value={qrB64.startsWith('qr:') ? qrB64.slice(3) : qrB64} size={220} />
+              <QRCode
+                value={qrB64.startsWith('qr:') ? qrB64.slice(3) : qrB64}
+                size={280}
+                level="L"
+              />
             </div>
             <div style={{ fontSize: 13, color: '#64748b', lineHeight: 1.6 }}>
               Open WhatsApp → <strong>Linked Devices</strong> → <strong>Link a Device</strong> → Scan this code
             </div>
-            <div style={{ marginTop: 12, fontSize: 12, color: '#94a3b8' }}>Checking connection every 3s…</div>
+            <div style={{ marginTop: 10, fontSize: 12 }}>
+              QR not scanning? <a href="/api/whatsapp/connect" target="_blank" rel="noreferrer"
+                style={{ color: '#25D366', fontWeight: 600 }}>Open standalone QR page ↗</a>
+            </div>
+            <div style={{ marginTop: 8, fontSize: 12, color: '#94a3b8' }}>Checking connection every 3s…</div>
           </div>
         )}
 
