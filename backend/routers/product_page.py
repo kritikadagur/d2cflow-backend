@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 def _get_product(product_id: str) -> dict:
     db = get_db()
-    row = db.table("products").select("*, skus(sku, selling_price, mrp, qty_available)").eq("id", product_id).execute()
+    row = db.table("products").select("*, skus(sku, selling_price, mrp, inventory(qty_available, qty_on_hand))").eq("id", product_id).execute()
     if not row.data:
         raise HTTPException(status_code=404, detail="Product not found")
     return row.data[0]

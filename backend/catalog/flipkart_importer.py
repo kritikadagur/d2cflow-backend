@@ -103,9 +103,15 @@ class FlipkartCatalogImporter:
                 "product_id": product_id,
                 "mrp": mrp,
                 "selling_price": selling_price,
-                "qty_on_hand": qty,
                 "flipkart_fsn": fsn,
                 "updated_at": datetime.now(timezone.utc).isoformat(),
+            }, on_conflict="sku").execute()
+
+            # Stock lives on inventory table
+            db.table("inventory").upsert({
+                "sku": seller_sku,
+                "qty_on_hand": qty,
+                "last_synced_at": datetime.now(timezone.utc).isoformat(),
             }, on_conflict="sku").execute()
 
             db.table("listings").upsert({

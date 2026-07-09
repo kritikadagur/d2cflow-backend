@@ -46,7 +46,7 @@ def list_listings(
     user=Depends(get_current_user),
 ):
     db = get_db()
-    q = db.table("listings").select("*, skus(name, selling_price, qty_on_hand)").limit(200)
+    q = db.table("listings").select("*, skus(name, selling_price, inventory(qty_on_hand, qty_available))").limit(200)
     if channel:
         q = q.eq("channel", channel)
     if sku:

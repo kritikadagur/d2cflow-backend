@@ -47,7 +47,7 @@ def list_products(
 ):
     db = get_db()
     tenant_id = get_tenant_id(user)
-    q = db.table("products").select("*, skus(sku, selling_price, qty_on_hand)").eq("tenant_id", tenant_id).limit(limit)
+    q = db.table("products").select("*, skus(sku, selling_price, inventory(qty_on_hand, qty_available))").eq("tenant_id", tenant_id).limit(limit)
     if category:
         q = q.eq("category", category)
     if search:
@@ -123,13 +123,16 @@ def delete_product(product_id: str, user=Depends(get_current_user)):
 def create_variant(payload: VariantPayload, user=Depends(get_current_user)):
     db = get_db()
     tenant_id = get_tenant_id(user)
+    dims = payload.dimensions or {}
     # Upsert into skus table
     result = db.table("skus").upsert({
         "sku": payload.sku,
         "product_id": payload.product_id,
         "barcode": payload.barcode,
         "weight_grams": payload.weight_grams,
-        "dimensions": payload.dimensions or {},
+        "length_cm":  dims.get("length_cm")  or dims.get("length"),
+        "breadth_cm": dims.get("breadth_cm") or dims.get("breadth") or dims.get("width"),
+        "height_cm":  dims.get("height_cm")  or dims.get("height"),
         "color": payload.color,
         "size": payload.size,
         "mrp": payload.mrp,
@@ -360,14 +363,21 @@ def confirm_pdf_import(payload: ConfirmPdfImport, user=Depends(get_current_user)
             sku_code = _re.sub(r"[^A-Z0-9]", "-", name.upper())[:20].strip("-") + f"-{product_id[:6].upper()}"
 
         mrp = float(p.get("mrp") or price)
-        db.table("skus").upsert({
+        sku_row = db.table("skus").upsert({
             "sku": sku_code,
             "product_id": product_id,
             "name": name,
             "selling_price": price,
             "mrp": mrp if mrp >= price else price,
-            "qty_on_hand": int(p.get("stock") or 0),
         }, on_conflict="sku").execute()
+
+        # Stock lives on inventory (schema: inventory.qty_on_hand), not on skus
+        stock = int(p.get("stock") or 0)
+        if stock:
+            db.table("inventory").upsert({
+                "sku": sku_code,
+                "qty_on_hand": stock,
+            }, on_conflict="sku").execute()
 
         created += 1
 
@@ -375,4 +385,38 @@ def confirm_pdf_import(payload: ConfirmPdfImport, user=Depends(get_current_user)
         "created": created,
         "skipped": skipped,
         "message": f"{created} products added to your catalog.",
+    }
+
+
+# ------------------------------------------------------------------ #
+# One-shot PDF upload — parse + save in a single call (brief-compat)
+# ------------------------------------------------------------------ #
+
+@router.post("/upload")
+async def upload_pdf_catalog(file: UploadFile = File(...), user=Depends(get_current_user)):
+    """
+    Parse a PDF and persist products+SKUs in one call.
+    Prefer /import/pdf/preview + /import/pdf/confirm for a review step.
+    """
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="File must be a PDF")
+
+    contents = await file.read()
+    if len(contents) > 20 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="PDF too large. Max 20MB.")
+
+    try:
+        from ..catalog.pdf_importer import parse_pdf_catalog
+        parsed = parse_pdf_catalog(contents)
+    except ImportError:
+        raise HTTPException(status_code=503, detail="PDF parsing not available. Run: pip install pdfplumber")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not parse PDF: {e}")
+
+    result = confirm_pdf_import(ConfirmPdfImport(products=parsed), user=user)
+    return {
+        "extracted": len(parsed),
+        "saved": result["created"],
+        "skipped": result["skipped"],
+        "products": [{"name": p.get("name"), "price": p.get("price"), "sku": p.get("sku")} for p in parsed],
     }

@@ -927,19 +927,19 @@ def _get_products() -> List[dict]:
         return _synced_products
     try:
         db = get_db()
-        result = db.table("products").select("id, name, skus(sku, selling_price), inventory(qty_available, qty_on_hand)").limit(200).execute()
+        result = db.table("products").select("id, name, skus(sku, selling_price, mrp, inventory(qty_available, qty_on_hand))").limit(200).execute()
         if result.data:
             products = []
             for row in result.data:
                 sku_rows = row.get("skus") or []
-                inv_rows = row.get("inventory") or []
                 sku_row = sku_rows[0] if isinstance(sku_rows, list) and sku_rows else {}
+                inv_rows = sku_row.get("inventory") or []
                 inv_row = inv_rows[0] if isinstance(inv_rows, list) and inv_rows else {}
                 products.append({
                     "id": row.get("id"),
                     "name": row.get("name", ""),
                     "sku": sku_row.get("sku"),
-                    "price": _safe_float(sku_row.get("selling_price")),
+                    "price": _safe_float(sku_row.get("selling_price"), _safe_float(sku_row.get("mrp"))),
                     "stock": _safe_nonnegative_int(inv_row.get("qty_available"), _safe_nonnegative_int(inv_row.get("qty_on_hand"), 0)),
                 })
             return products
@@ -991,13 +991,6 @@ def _deduct_stock(product_id: str, qty: int) -> None:
             if result.data:
                 current = _safe_nonnegative_int(result.data.get("qty_on_hand"))
                 db.table("inventory").update({"qty_on_hand": max(0, current - _safe_int(qty))}).eq("sku", sku).execute()
-            return
-
-        # Legacy fallback for older local schemas that stored stock on products.
-        result = db.table("products").select("stock").eq("id", product_id).maybe_single().execute()
-        if result.data and "stock" in result.data:
-            current = _safe_nonnegative_int(result.data.get("stock"))
-            db.table("products").update({"stock": max(0, current - _safe_int(qty))}).eq("id", product_id).execute()
     except Exception as e:
         logger.debug("Could not deduct stock for %s: %s", product_id, e)
 

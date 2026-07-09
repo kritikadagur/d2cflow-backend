@@ -76,9 +76,9 @@ class CODZoneEngine:
             # Check if in a blocked zone
             blocked = self.is_cod_blocked(order.get("pincode", ""))
             if blocked:
+                # Reason stored via automation_logs (orders has no cancel_reason column)
                 db.table("orders").update({
                     "status": "cancelled",
-                    "cancel_reason": "cod_blocked_zone",
                     "updated_at": datetime.now(timezone.utc).isoformat(),
                 }).eq("id", order["id"]).execute()
                 log_event("cod_auto_cancelled", "order", order["channel_order_id"], "success",

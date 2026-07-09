@@ -101,7 +101,6 @@ def update_claim(return_id: str, payload: ClaimUpdatePayload, user=Depends(get_c
     db.table("returns").update({
         "claim_status": payload.claim_status,
         "claim_amount": payload.claim_amount,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
     }).eq("id", return_id).execute()
     return {"status": "updated"}
 

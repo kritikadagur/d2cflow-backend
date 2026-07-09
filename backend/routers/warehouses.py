@@ -87,11 +87,18 @@ def delete_warehouse(warehouse_id: str, user=Depends(get_current_user)):
 
 @router.get("/{warehouse_id}/inventory")
 def warehouse_inventory(warehouse_id: str, user=Depends(get_current_user)):
+    """
+    Inventory for a warehouse.
+
+    Schema note: `inventory` is not keyed by warehouse — it holds one row per SKU with
+    global on-hand qty. Warehouse routing is on `orders.warehouse_id` + `warehouses` +
+    `warehouse_routing_rules`. Until per-warehouse inventory is added to the schema, we
+    return the tenant's global inventory alongside the warehouse's SKU catalog.
+    """
     db = get_db()
     return (
         db.table("inventory")
         .select("*, skus(name, category)")
-        .eq("warehouse_id", warehouse_id)
         .execute()
         .data
     )
