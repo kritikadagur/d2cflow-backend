@@ -4,12 +4,13 @@ Live status snapshot after Priority 1 pass on `main`.
 
 ## Deployment topology (documented for the record)
 
-- **FastAPI backend → Vercel** (`api/index.py` → `backend.main:app`).
-  URL: `https://project-zw1nb-8f8wc8aj9-kritika-dagur-s-projects.vercel.app`
-- **WhatsApp Node bridge → Render** (`whatsapp-bridge/`).
+- **FastAPI backend → Render** (`d2cflow-backend`, `srv-d9321hok1i2s73dejb10`)
+  URL: `https://d2cflow-backend-r8xg.onrender.com` — always-on, runs `uvicorn backend.main:app`, in-process APScheduler starts on boot.
+- **WhatsApp Node bridge → Render** (`d2cflow-backend-1`, `srv-d932b18k1i2s73df5dpg`, `whatsapp-bridge/`).
   URL: `https://d2cflow-backend-1.onrender.com`
-- Root `render.yaml` declares a `d2cflow-backend` Python service that is **not deployed** (Vercel serves that role). Cleanup TODO.
-- Every `git push origin main` triggers **two** auto-deploys (Vercel + Render).
+- **Historical Vercel deploy** (`api/index.py` → `backend.main:app`) still exists at `https://project-zw1nb-8f8wc8aj9-kritika-dagur-s-projects.vercel.app` but is superseded — the scheduler can't run there. Recommend removing/disconnecting.
+- Both Render services now track **`github.com/kritikadagur/d2cflow-backend`** on `main` with autoDeploy=yes. Pushes to your fork trigger both rebuilds.
+- Previously both services pointed at `raktimtalukdar-cpu/d2cflow-backend` — that's why earlier pushes to your fork appeared to have no effect. Fixed.
 
 ## P1a — Audit
 - `AUDIT.md` written. 8 real column/table mismatches found; all listed below with their fix.
@@ -35,9 +36,7 @@ No code changes needed. Verified against schema:
 ## P1e — Scheduler
 **No code change.** `backend/scheduler.py::start_scheduler` already registers all 4 engines required by the brief (`InventoryEngine.run_all` hourly, `OrderAutomationEngine.run_all` every 30min, `ShiprocketClient.auto_ship_rtd_orders` hourly at :15, `ReturnsEngine.run_all` every 6h) plus 11 additional jobs, and calls `scheduler.start()` after `add_job`.
 
-**Known blocker (architectural, not fixable in code):** Vercel is serverless — Python processes are killed after each request, so `APScheduler` cannot run there. `main.py::lifespan` calls `start_scheduler()`, but nothing keeps the process alive between requests on Vercel.
-
-**Path forward (deferred):** deploy the declared `d2cflow-backend` service in root `render.yaml` as an always-on Render worker whose sole job is to run APScheduler + the same `backend.main:app`. Then either point traffic there too (single backend) or keep Vercel for HTTP + Render for scheduler. Not doing this now.
+**Now running:** FastAPI is deployed on Render as an always-on service, so `lifespan` fires `start_scheduler()` on boot and the APScheduler thread stays alive between requests. Verified via `/health/detailed` uptime counter.
 
 ## P1a audit — 8 mismatches, all fixed
 
@@ -56,14 +55,30 @@ No code changes needed. Verified against schema:
 
 - All 8 touched files pass `python3 -m py_compile`.
 - Ad-hoc unit test for `_get_products()` price fallback: PASS (4/4 scenarios).
-- Live production endpoints verified:
-  - `GET /health` → `{"status":"ok","version":"1.0.0"}`
-  - `GET /health/detailed` → whatsapp+metrics blocks populated
-  - `GET /api/orders` → `[]` (empty DB)
-  - `GET /api/whatsapp/bridge-status` (WA bridge on Render) → `{status:"ok", connected:false, phone:""}`
-- Not verified (needs seeded data): `/api/whatsapp/products` non-zero prices, `/api/inventory` rows, `/api/payments/status` (needs Razorpay keys in Vercel env), `/api/catalog/upload` PDF round-trip. Will seed after this deploy.
+- 3 seed products/SKUs/inventory rows inserted under tenant `9e107047…` via Supabase REST.
+- P1f smoke tests against live Render FastAPI (7/7 PASS):
 
-## Not-in-code-but-worth-flagging
+  | # | Endpoint | Result |
+  |---|---|---|
+  | 1 | `GET /health` | 200 `{"status":"ok","version":"1.0.0"}` |
+  | 2 | `GET /health/detailed` | 200 with metrics + whatsapp block |
+  | 3 | `GET /api/orders` | 200 `[]` |
+  | 4 | `GET /api/inventory` | 200, 3 rows w/ `qty_available` computed |
+  | 5 | `GET /api/whatsapp/bridge-status` | 200 `connected:false, qr_available:true` |
+  | 6 | `GET /api/whatsapp/products` | 200, 3 products with non-zero prices |
+  | 7 | `GET /api/payments/status` (no JWT) | 401 (correct — auth required) |
 
-- `.env` missing 10 secrets that live on Vercel: `RAZORPAY_KEY_ID/SECRET/WEBHOOK_SECRET`, `META_APP_ID/APP_SECRET/WEBHOOK_VERIFY_TOKEN`, `SMTP_HOST/PORT/USER/PASSWORD`. Production runs off Vercel's env store; local `.env` is incomplete on purpose.
-- Root `render.yaml` `d2cflow-backend` service is a spec-only ghost — either deploy it (P1e path forward) or delete the block.
+## Outstanding — one-time manual steps
+
+1. **Run the missing FK ALTER in Supabase SQL Editor** (once):
+   ```sql
+   alter table skus drop constraint if exists skus_product_id_fkey;
+   alter table skus add constraint skus_product_id_fkey
+     foreign key (product_id) references products(id) on delete set null;
+   notify pgrst, 'reload schema';
+   ```
+   Without this, PostgREST cannot embed `products→skus`. Endpoint `/api/whatsapp/products` falls back to the flat `skus` path (works but returns default `stock:99` — real stock never joins in). Applying this FK makes stock=50/30/20 flow through correctly for the seed data.
+
+2. **Decide the Vercel deployment's fate.** It's still there and still deploys on every push. If you want a single source of truth, disconnect the Vercel project or turn off its GitHub integration. FIXES.md now names Render as the canonical FastAPI URL.
+
+3. **Rotate the Render API key** shared during this session.
