@@ -933,14 +933,16 @@ def _get_products() -> List[dict]:
             for row in result.data:
                 sku_rows = row.get("skus") or []
                 sku_row = sku_rows[0] if isinstance(sku_rows, list) and sku_rows else {}
-                inv_rows = sku_row.get("inventory") or []
-                inv_row = inv_rows[0] if isinstance(inv_rows, list) and inv_rows else {}
+                inv = sku_row.get("inventory") or {}
+                # PostgREST returns dict for 1:1 embed, list for 1:many
+                if isinstance(inv, list):
+                    inv = inv[0] if inv else {}
                 products.append({
                     "id": row.get("id"),
                     "name": row.get("name", ""),
                     "sku": sku_row.get("sku"),
                     "price": _safe_float(sku_row.get("selling_price"), _safe_float(sku_row.get("mrp"))),
-                    "stock": _safe_nonnegative_int(inv_row.get("qty_available"), _safe_nonnegative_int(inv_row.get("qty_on_hand"), 0)),
+                    "stock": _safe_nonnegative_int(inv.get("qty_available"), _safe_nonnegative_int(inv.get("qty_on_hand"), 0)),
                 })
             return products
     except Exception:
