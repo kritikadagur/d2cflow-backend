@@ -1,12 +1,10 @@
 {
   "version": 2,
-  "builds": [
-    { "src": "api/index.py", "use": "@vercel/python" }
-  ],
-  "routes": [
-    { "src": "/(.*)", "dest": "/api/index.py" }
-  ],
-  "env": {
-    "WHATSAPP_BRIDGE_API": "https://d2cflow-backend-1.onrender.com"
-  }
+  "redirects": [
+    {
+      "source": "/(.*)",
+      "destination": "https://d2cflow-backend-r8xg.onrender.com/$1",
+      "permanent": true
+    }
+  ]
 }
