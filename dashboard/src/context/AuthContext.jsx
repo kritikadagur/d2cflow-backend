@@ -1,5 +1,5 @@
 import { createContext, useContext, useState, useEffect } from 'react';
-import { supabase } from '../lib/supabase';
+import { supabase, nukeLocalSupabaseSession } from '../lib/supabase';
 
 const AuthContext = createContext(null);
 
@@ -9,12 +9,23 @@ export function AuthProvider({ children }) {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    supabase.auth.getSession().then(({ data: { session } }) => {
-      setSession(session);
-      setUser(session?.user ?? null);
-      if (session) localStorage.setItem('d2c_session', JSON.stringify(session));
+    // If signOut just ran this session, don't let getSession() rehydrate a stale token.
+    // Consume the flag once so a subsequent successful sign-in isn't broken.
+    const wasSignedOut = localStorage.getItem('d2c_signed_out') === '1';
+    if (wasSignedOut) {
+      nukeLocalSupabaseSession();
+      localStorage.removeItem('d2c_signed_out');
+      setSession(null);
+      setUser(null);
       setLoading(false);
-    });
+    } else {
+      supabase.auth.getSession().then(({ data: { session } }) => {
+        setSession(session);
+        setUser(session?.user ?? null);
+        if (session) localStorage.setItem('d2c_session', JSON.stringify(session));
+        setLoading(false);
+      });
+    }
 
     const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
       setSession(session);
@@ -64,11 +75,31 @@ export function AuthProvider({ children }) {
   };
 
   const signOut = async () => {
-    try { await supabase.auth.signOut(); } catch (_) {}
+    // Set the flag FIRST so if anything below races, next reload still respects it
+    localStorage.setItem('d2c_signed_out', '1');
+
+    // Nuke supabase-js token storage BEFORE calling signOut() — signOut()'s
+    // network round-trip can hang or 401, but we still want the client-side
+    // session gone unconditionally.
+    nukeLocalSupabaseSession();
+
+    // Clear our app's own cached state so a re-login starts fresh
     localStorage.removeItem('d2c_session');
     localStorage.removeItem('d2cflow_integrations');
-    localStorage.setItem('d2c_signed_out', '1');
-    window.location.reload();
+    localStorage.removeItem('d2cflow_orders');
+    localStorage.removeItem('d2cflow_products');
+    localStorage.removeItem('d2cflow_crm_contacts');
+
+    // Fire supabase.auth.signOut() but don't block on it
+    try {
+      await Promise.race([
+        supabase.auth.signOut({ scope: 'local' }),
+        new Promise(res => setTimeout(res, 1500)),
+      ]);
+    } catch {}
+
+    // Hard reload to home — location.replace prevents back-button restoring the app state
+    window.location.replace('/');
   };
 
   return (
