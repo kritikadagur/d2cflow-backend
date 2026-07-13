@@ -235,6 +235,25 @@ def _extract_from_ocr(pdf_path_or_bytes) -> list[dict]:
     return _products_from_raw_text(ocr_text, source="pdf_ocr")
 
 
+def _text_extraction_looks_broken(products: list[dict]) -> bool:
+    """
+    Heuristic: text extraction succeeded superficially but yielded nonsense —
+    e.g. names shorter than 5 chars, or names that are just price fragments.
+    Trigger OCR fallback in that case.
+    """
+    if not products:
+        return True
+    if len(products) > 3:
+        return False  # probably legitimate
+    for p in products:
+        n = (p.get("name") or "").strip()
+        # names that look like OCR noise: <=4 chars, or contain ~/f-/1- garbage
+        if len(n) < 5 or any(sig in n for sig in ("~", "MRP", "1-", "f-", "-~")):
+            continue
+        return False  # at least one clean product — trust text extraction
+    return True
+
+
 def parse_pdf_catalog(file_bytes: bytes) -> list[dict]:
     """
     Main entry point. Returns a list of product dicts for merchant review.
@@ -246,12 +265,23 @@ def parse_pdf_catalog(file_bytes: bytes) -> list[dict]:
       3. OCR pattern matching (image-only PDFs — needs tesseract on host)
     """
     products = _extract_from_tables(file_bytes)
-    if not products:
-        products = _extract_from_text(file_bytes)
-    if not products:
-        # OCR fallback — slow (~5-15s), only invoked if the PDF has no text layer
-        logger.info("Text extraction yielded 0 products; falling back to OCR")
-        products = _extract_from_ocr(file_bytes)
+    if _text_extraction_looks_broken(products):
+        text_products = _extract_from_text(file_bytes)
+        if not _text_extraction_looks_broken(text_products):
+            products = text_products
+        else:
+            # OCR fallback — slow (~5-15s), only invoked when text extraction
+            # yields nothing usable
+            logger.info(
+                "Table+text extraction yielded %d suspect products; falling back to OCR",
+                len(text_products),
+            )
+            ocr_products = _extract_from_ocr(file_bytes)
+            if ocr_products:
+                products = ocr_products
+            elif text_products:
+                # Keep whatever text we got if OCR also failed
+                products = text_products
 
     # Deduplicate by name (case-insensitive)
     seen = set()
