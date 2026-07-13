@@ -12,3 +12,7 @@ python-dotenv==1.0.1
 PyJWT==2.9.0
 python-multipart==0.0.9
 pdfplumber==0.11.4
+# OCR fallback for image-only PDF catalogs (requires tesseract binary on host)
+pymupdf==1.24.10
+pytesseract==0.3.13
+Pillow>=10.4.0
