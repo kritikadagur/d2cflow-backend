@@ -578,23 +578,22 @@ function WhatsAppModal({ onClose, onConnected }) {
   };
 
   const handleConnect = async () => {
+    // Don't try to spawn a local bridge process — that only works in dev.
+    // On Render/Vercel the bridge is already a separate service; just start
+    // polling for the QR that it emits.
     setError('');
-    setStep('starting');
-    try {
-      await waFetch('/api/whatsapp/start-bridge', { method: 'POST' });
-      setStep('qr');
-      startPolling();
-      // Get initial QR immediately
-      setTimeout(async () => {
-        try {
-          const d = await waFetch('/api/whatsapp/bridge-status');
-          if (d.qr_b64) setQrData(d.qr_b64.replace(/^qr:/, ''));
-        } catch (_) {}
-      }, 2000);
-    } catch (e) {
-      setError(e.message || 'Could not start WhatsApp bridge. Make sure you are running the server locally.');
-      setStep('idle');
-    }
+    setStep('qr');
+    startPolling();
+    setTimeout(async () => {
+      try {
+        const d = await waFetch('/api/whatsapp/bridge-status');
+        if (d.qr_b64) setQrData(d.qr_b64.replace(/^qr:/, ''));
+        else if (d.connected) setStep('connected');
+      } catch (e) {
+        setError(e.message || 'Could not reach WhatsApp bridge.');
+        setStep('idle');
+      }
+    }, 1500);
   };
 
   const loadOrders = () => {

@@ -27,8 +27,9 @@ function truncate(t, n = 60) { return t && t.length > n ? t.slice(0, n) + '…' 
 // ── QR Connect Screen ─────────────────────────────────────────────────────────
 
 function QRConnectScreen({ onConnected }) {
-  const [status, setStatus] = useState('starting'); // idle | starting | qr | connected
+  const [status, setStatus] = useState('starting'); // starting | qr | connected | error
   const [qrB64, setQrB64] = useState(null);
+  const [errMsg, setErrMsg] = useState('');
   const pollRef = useRef(null);
 
   const checkStatus = useCallback(async () => {
@@ -41,8 +42,15 @@ function QRConnectScreen({ onConnected }) {
       } else if (d.qr_available && d.qr_b64) {
         setStatus('qr');
         setQrB64(d.qr_b64);
+      } else if (d.bridge_running === false) {
+        setStatus('error');
+        setErrMsg('Bridge service is starting up on Render (30-60s cold start). It will appear automatically.');
       }
-    } catch { /* backend not ready yet */ }
+    } catch (e) {
+      // Only surface polling errors after a few failed attempts to avoid noise during cold-start
+      setStatus('error');
+      setErrMsg(e?.message ? `Bridge unreachable: ${e.message}` : 'Bridge unreachable');
+    }
   }, [onConnected]);
 
   useEffect(() => {
@@ -51,21 +59,11 @@ function QRConnectScreen({ onConnected }) {
     return () => clearInterval(pollRef.current);
   }, [checkStatus]);
 
-  const handleStart = async () => {
-    setStatus('starting');
-    try {
-      await apiFetch('/api/whatsapp/start-bridge', { method: 'POST' });
-      toast.info('Bridge starting… waiting for QR');
-    } catch (e) {
-      const msg = e.message || 'Failed to start bridge';
-      if (msg.includes('serverless') || msg.includes('WHATSAPP_BRIDGE_API')) {
-        setStatus('serverless');
-      } else {
-        toast.error(msg);
-        setStatus('idle');
-      }
-    }
-  };
+  // Note: no manual "Connect" button here. The QR appears automatically once the
+  // remote Baileys bridge boots and emits its first QR (typically ≤10s). The old
+  // handleStart() path called POST /start-bridge which is only valid when the
+  // bridge runs in-process (local dev). On Render/Vercel it either no-ops or
+  // errors, so removing the button prevents user-facing 500s.
 
   if (status === 'connected') return (
     <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', minHeight: '70vh', gap: 16 }}>
@@ -84,17 +82,22 @@ function QRConnectScreen({ onConnected }) {
           Scan the QR code with your WhatsApp app to enable real-time order scanning.
         </p>
 
-        {status === 'idle' && (
-          <button className="btn btn-primary" onClick={handleStart}
-            style={{ background: '#25D366', borderColor: '#25D366', width: '100%', padding: '12px 0', fontSize: 14 }}>
-            📱 Connect WhatsApp
-          </button>
-        )}
-
         {status === 'starting' && (
           <div style={{ color: '#64748b', fontSize: 13 }}>
             <div style={{ width: 28, height: 28, border: '3px solid #e2e8f0', borderTop: '3px solid #25D366', borderRadius: '50%', animation: 'wa-spin 0.8s linear infinite', margin: '0 auto 12px' }} />
-            Starting bridge… checking for QR code
+            Loading QR… (Render free-tier can take up to 60s the first time)
+          </div>
+        )}
+
+        {status === 'error' && (
+          <div>
+            <div style={{ background: '#fef9c3', border: '1px solid #fde68a', borderRadius: 10, padding: '14px 16px', textAlign: 'left', color: '#78350f', fontSize: 13, lineHeight: 1.6 }}>
+              {errMsg}
+            </div>
+            <div style={{ marginTop: 12, fontSize: 12 }}>
+              <a href="/api/whatsapp/connect" target="_blank" rel="noreferrer"
+                style={{ color: '#25D366', fontWeight: 600 }}>Open standalone QR page ↗</a>
+            </div>
           </div>
         )}
 
