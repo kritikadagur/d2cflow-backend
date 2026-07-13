@@ -1,10 +1,15 @@
 {
   "version": 2,
-  "redirects": [
+  "headers": [
     {
       "source": "/(.*)",
-      "destination": "https://d2cflow-backend-r8xg.onrender.com/$1",
-      "permanent": true
+      "headers": [
+        { "key": "X-Deployment-Status", "value": "retired" },
+        { "key": "Cache-Control", "value": "no-store, no-cache, must-revalidate" }
+      ]
     }
+  ],
+  "rewrites": [
+    { "source": "/(.*)", "destination": "/retired.html" }
   ]
 }

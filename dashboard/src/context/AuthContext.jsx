@@ -56,9 +56,14 @@ export function AuthProvider({ children }) {
   };
 
   const signInWithGoogle = async () => {
+    // Force the canonical production origin so a stale Vercel URL never gets
+    // baked into the OAuth redirect. Falls back to current origin in dev.
+    const redirect = /localhost|127\.0\.0\.1/.test(window.location.origin)
+      ? window.location.origin
+      : 'https://d2cflow-backend-r8xg.onrender.com';
     const { data, error } = await supabase.auth.signInWithOAuth({
       provider: 'google',
-      options: { redirectTo: window.location.origin },
+      options: { redirectTo: redirect },
     });
     console.log('[Google OAuth] data:', data, 'error:', error);
     if (error) return { data, error };
@@ -67,9 +72,12 @@ export function AuthProvider({ children }) {
   };
 
   const signInWithMagicLink = async (email) => {
+    const redirect = /localhost|127\.0\.0\.1/.test(window.location.origin)
+      ? window.location.origin
+      : 'https://d2cflow-backend-r8xg.onrender.com';
     const { data, error } = await supabase.auth.signInWithOtp({
       email,
-      options: { emailRedirectTo: window.location.origin },
+      options: { emailRedirectTo: redirect },
     });
     return { data, error };
   };
